@@ -1,10 +1,10 @@
 """票房归集服务。
 
 负责：
-- 将订单/退款转换为票房流水
+- 将订单/退款转换为票房流水（明细层，sale/refund）
+- 按场次聚合并执行分账（场次结算层 settlement）
 - 维护票房汇总（按演出/场次/渠道/账期维度）
-- 处理订单号、流水号生成
-- 调用分账引擎进行分账
+- 处理流水号生成
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from django.db import transaction
-from django.db.models import F, QuerySet, Sum
+from django.db.models import F, Max, QuerySet, Sum
 from django.utils import timezone
 
 from ..models import (
@@ -40,15 +40,8 @@ def _gen_flow_no(prefix: str = "BF") -> str:
     return f"{prefix}{ts}{rand}"
 
 
-def _gen_order_no(prefix: str = "T") -> str:
-    """生成订单号。"""
-    ts = timezone.now().strftime("%Y%m%d%H%M%S")
-    rand = uuid.uuid4().hex[:6].upper()
-    return f"{prefix}{ts}{rand}"
-
-
 class BoxOfficeService:
-    """票房归集服务。"""
+    """票房归集服务（场次级聚合分账架构）。"""
 
     @staticmethod
     def _get_active_split_rule(performance: Performance) -> Optional[SplitRule]:
@@ -80,16 +73,14 @@ class BoxOfficeService:
 
     @staticmethod
     @transaction.atomic
-    def collect_from_order(order: TicketOrder) -> Tuple[BoxOfficeFlow, List[SplitDetail]]:
-        """从已支付订单归集票房流水并执行分账。"""
-        if BoxOfficeFlow.objects.filter(order=order, flow_type="sale").exists():
-            flow = BoxOfficeFlow.objects.filter(order=order, flow_type="sale").first()
-            splits = list(SplitDetail.objects.filter(flow=flow).select_related("party"))
-            return flow, splits
+    def collect_from_order(order: TicketOrder) -> BoxOfficeFlow:
+        """从已支付订单创建 sale 型票房流水（仅明细，不执行分账）。
 
-        if not order.order_no:
-            order.order_no = _gen_order_no()
-            order.save(update_fields=["order_no"])
+        分账会在 settle_performance 场次级聚合时执行。
+        """
+        existing = BoxOfficeFlow.objects.filter(order=order, flow_type="sale").first()
+        if existing:
+            return existing
 
         perf = order.performance
         show = perf.show
@@ -120,25 +111,13 @@ class BoxOfficeService:
             biz_date=biz_date,
         )
 
-        rule = BoxOfficeService._get_active_split_rule(perf)
-        split_details: List[SplitDetail] = []
-        if rule:
-            engine = SplitRuleEngine(rule)
-            input_data = SplitInput(
-                gross_amount=gross,
-                refund_amount=ZERO,
-                payment_fee=q2(order.payment_fee),
-                channel_fee=q2(order.channel_fee),
-                coupon_discount=q2(order.coupon_discount),
-                points_discount=q2(order.points_discount),
-                should_split_amount=should_split,
-                coupon_bearer_party_id=order.coupon_bearer_party_id,
-                points_bearer_party_id=order.points_bearer_party_id,
-            )
-            split_details = engine.apply_split(flow, input_data)
-
         BoxOfficeService._update_summaries(flow)
-        return flow, split_details
+
+        # 场次增加已售座位数
+        if order.status in ("paid", "partial_refunded"):
+            Performance.objects.filter(pk=perf.pk).update(sold_seats=F("sold_seats") + order.quantity)
+
+        return flow
 
     @staticmethod
     @transaction.atomic
@@ -149,8 +128,8 @@ class BoxOfficeService:
         refund_fee: Decimal = ZERO,
         reason: str = "",
         operator: str = "",
-    ) -> Tuple[RefundRecord, BoxOfficeFlow, List[SplitDetail]]:
-        """处理退款：创建退款记录、生成回滚流水、执行分账回滚。"""
+    ) -> Tuple[RefundRecord, BoxOfficeFlow]:
+        """处理退款：创建退款记录 + refund 流水（不直接分账），随后自动重算场次结算。"""
         qty = refund_quantity or order.quantity
         amt = q2(refund_amount)
         if amt <= ZERO:
@@ -183,7 +162,7 @@ class BoxOfficeService:
 
         original_flow = BoxOfficeFlow.objects.filter(order=order, flow_type="sale").first()
         if not original_flow:
-            original_flow, _ = BoxOfficeService.collect_from_order(order)
+            original_flow = BoxOfficeService.collect_from_order(order)
 
         biz_date = timezone.now().date()
         perf = order.performance
@@ -211,25 +190,6 @@ class BoxOfficeService:
             biz_date=biz_date,
         )
 
-        rule = BoxOfficeService._get_active_split_rule(perf)
-        rollback_details: List[SplitDetail] = []
-        parent_splits: Dict[int, SplitDetail] = {}
-        for sd in SplitDetail.objects.filter(flow=original_flow, rollback_status="normal").select_related("party"):
-            parent_splits[sd.party_id] = sd
-
-        if rule and parent_splits:
-            engine = SplitRuleEngine(rule)
-            input_data = SplitInput(
-                gross_amount=q2(-amt),
-                refund_amount=amt,
-                payment_fee=q2(-refund_fee),
-                channel_fee=ZERO,
-                coupon_discount=ZERO,
-                points_discount=ZERO,
-                should_split_amount=q2(-amt + refund_fee),
-            )
-            rollback_details = engine.apply_split(rollback_flow, input_data, parent_splits=parent_splits)
-
         SplitRollback.objects.create(
             refund=refund,
             order=order,
@@ -239,11 +199,166 @@ class BoxOfficeService:
         )
 
         BoxOfficeService._update_summaries(rollback_flow)
-        return refund, rollback_flow, rollback_details
+
+        # 重算该场次的场次结算（聚合后再分账）
+        BoxOfficeService.settle_performance(perf.pk)
+
+        return refund, rollback_flow
+
+    @staticmethod
+    @transaction.atomic
+    def settle_performance(performance_id: int) -> Tuple[Optional[BoxOfficeFlow], List[SplitDetail]]:
+        """按场次聚合并执行分账（核心：fixed 租金只应用 1 次/场）。
+
+        流程：
+        1. 聚合该场次所有 sale/refund 明细流水
+        2. 删除之前的 settlement 流水及其关联分账明细
+        3. 创建新的场次结算流水 flow_type="settlement"
+        4. 在 settlement 流水上执行分账引擎
+        """
+        perf = Performance.objects.select_related("show").get(pk=performance_id)
+        show = perf.show
+
+        # 1. 聚合所有明细流水（sale / refund）
+        detail_flows = BoxOfficeFlow.objects.filter(
+            performance_id=performance_id,
+            flow_type__in=["sale", "refund"],
+        )
+
+        if not detail_flows.exists():
+            # 没有明细流水，清除可能存在的旧 settlement
+            BoxOfficeFlow.objects.filter(
+                performance_id=performance_id,
+                flow_type="settlement",
+            ).delete()
+            return None, []
+
+        agg = detail_flows.aggregate(
+            total_quantity=Sum("quantity"),
+            total_ticket_amount=Sum("ticket_amount"),
+            total_coupon=Sum("coupon_discount"),
+            total_points=Sum("points_discount"),
+            total_gross=Sum("gross_amount"),
+            total_pay_fee=Sum("payment_fee"),
+            total_ch_fee=Sum("channel_fee"),
+            total_refund_amt=Sum("refund_amount"),
+            total_net=Sum("net_received"),
+            total_should=Sum("should_split_amount"),
+            biz_date_max=Max("biz_date"),
+        )
+
+        t_qty = int(agg["total_quantity"] or 0)
+        t_ticket = q2(agg["total_ticket_amount"])
+        t_coupon = q2(agg["total_coupon"])
+        t_points = q2(agg["total_points"])
+        t_gross = q2(agg["total_gross"])
+        t_pay_fee = q2(agg["total_pay_fee"])
+        t_ch_fee = q2(agg["total_ch_fee"])
+        t_refund = q2(agg["total_refund_amt"])
+        t_net = q2(agg["total_net"])
+        t_should = q2(agg["total_should"])
+        biz_date = agg["biz_date_max"] or timezone.now().date()
+
+        # 2. 聚合优惠/积分抵扣的承担方（按 party 分组累计）
+        coupon_bear_map: Dict[int, Decimal] = {}
+        points_bear_map: Dict[int, Decimal] = {}
+        for order in TicketOrder.objects.filter(
+            pk__in=detail_flows.exclude(order_id__isnull=True).values_list("order_id", flat=True)
+        ).select_related("coupon_bearer_party", "points_bearer_party"):
+            cpn_bearer_id = order.coupon_bearer_party_id
+            pts_bearer_id = order.points_bearer_party_id
+            if cpn_bearer_id and order.coupon_discount > ZERO:
+                coupon_bear_map[cpn_bearer_id] = q2(
+                    coupon_bear_map.get(cpn_bearer_id, ZERO) + order.coupon_discount
+                )
+            if pts_bearer_id and order.points_discount > ZERO:
+                points_bear_map[pts_bearer_id] = q2(
+                    points_bear_map.get(pts_bearer_id, ZERO) + order.points_discount
+                )
+
+        # 3. 删除之前的 settlement 流水和关联分账（先清分账再清流水，避免 FK 约束）
+        old_settlements = BoxOfficeFlow.objects.filter(
+            performance_id=performance_id,
+            flow_type="settlement",
+        )
+        if old_settlements.exists():
+            old_ids = list(old_settlements.values_list("pk", flat=True))
+            # 删除分账明细（先清 FK 关联的自引用 parent_split）
+            SplitDetail.objects.filter(flow_id__in=old_ids).update(parent_split=None)
+            SplitDetail.objects.filter(flow_id__in=old_ids).delete()
+            # 更新 summaries（settlement 流水不参与汇总，但以防万一）
+            old_settlements.delete()
+
+        # 4. 创建场次结算流水
+        rule = BoxOfficeService._get_active_split_rule(perf)
+        settle_flow = BoxOfficeFlow.objects.create(
+            performance=perf,
+            show=show,
+            order=None,
+            refund=None,
+            channel=None,
+            flow_type="settlement",
+            flow_no=_gen_flow_no("BFSettle"),
+            quantity=t_qty,
+            ticket_amount=t_ticket,
+            coupon_discount=t_coupon,
+            points_discount=t_points,
+            gross_amount=t_gross,
+            payment_fee=t_pay_fee,
+            channel_fee=t_ch_fee,
+            refund_amount=t_refund,
+            net_received=t_net,
+            should_split_amount=t_should,
+            is_settled=False,
+            biz_date=biz_date,
+        )
+
+        # 5. 执行场次级分账
+        split_details: List[SplitDetail] = []
+        if rule and t_should != ZERO:
+            engine = SplitRuleEngine(rule)
+            input_data = SplitInput(
+                gross_amount=t_gross,
+                refund_amount=t_refund,
+                payment_fee=t_pay_fee,
+                channel_fee=t_ch_fee,
+                coupon_discount=t_coupon,
+                points_discount=t_points,
+                should_split_amount=t_should,
+                is_refund=False,
+                coupon_bearer_type="platform",  # 默认，会被 by_party 覆盖
+                points_bearer_type="platform",
+                refund_bearer_type="share",
+                coupon_bear_by_party=coupon_bear_map or None,
+                points_bear_by_party=points_bear_map or None,
+            )
+            split_details = engine.apply_split(settle_flow, input_data)
+
+        # 6. 标记所有明细流水为已结算（追溯用）
+        detail_flows.update(is_settled=True)
+
+        return settle_flow, split_details
+
+    @staticmethod
+    def settle_all_performances() -> Dict[str, int]:
+        """批量重新结算所有有明细流水的场次。"""
+        perf_ids = (
+            BoxOfficeFlow.objects.filter(flow_type__in=["sale", "refund"])
+            .values_list("performance_id", flat=True)
+            .distinct()
+        )
+        settled = 0
+        for pid in perf_ids:
+            BoxOfficeService.settle_performance(pid)
+            settled += 1
+        return {"settled_performances": settled}
 
     @staticmethod
     def _update_summaries(flow: BoxOfficeFlow) -> None:
-        """更新各维度票房汇总。"""
+        """更新各维度票房汇总。settlement 类型流水跳过（已由 sale/refund 累计）。"""
+        if flow.flow_type == "settlement":
+            return
+
         dims: List[Tuple[str, str, Dict]] = []
         dims.append((
             "performance",
@@ -314,14 +429,14 @@ class BoxOfficeService:
 
     @staticmethod
     def collect_all_orders() -> Dict[str, int]:
-        """扫描所有已支付但未归集的订单，批量归集。"""
+        """扫描所有已支付但未归集的订单，批量归集 + 批量执行场次结算。"""
         collected = 0
-        refunded = 0
-        for order in TicketOrder.objects.filter(status="paid").iterator():
+        for order in TicketOrder.objects.filter(status__in=["paid", "partial_refunded", "refunded"]).iterator():
             if not BoxOfficeFlow.objects.filter(order=order, flow_type="sale").exists():
                 BoxOfficeService.collect_from_order(order)
                 collected += 1
-        return {"collected": collected, "refunded": refunded}
+        settle_stats = BoxOfficeService.settle_all_performances()
+        return {"collected": collected, **settle_stats}
 
     @staticmethod
     def get_period_flows(
@@ -331,7 +446,7 @@ class BoxOfficeService:
         performance_id: Optional[int] = None,
         channel_id: Optional[int] = None,
     ) -> QuerySet:
-        """获取指定账期的票房流水。"""
+        """获取指定账期的票房流水（sale/refund 明细 + settlement 聚合）。"""
         qs = BoxOfficeFlow.objects.filter(biz_date__gte=period_start, biz_date__lte=period_end)
         if show_id:
             qs = qs.filter(show_id=show_id)
@@ -340,3 +455,4 @@ class BoxOfficeService:
         if channel_id:
             qs = qs.filter(channel_id=channel_id)
         return qs.select_related("show", "performance", "order", "channel", "refund")
+

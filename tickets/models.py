@@ -1,5 +1,15 @@
+import uuid
+
 from django.db import models
 from django.db.models import F, Sum
+from django.utils import timezone
+
+
+def _gen_unique_no(prefix: str, suffix_len: int = 6) -> str:
+    """生成业务单号：前缀 + 时间戳 + 随机串。"""
+    ts = timezone.now().strftime("%Y%m%d%H%M%S")
+    rand = uuid.uuid4().hex[:suffix_len].upper()
+    return f"{prefix}{ts}{rand}"
 
 
 class Show(models.Model):
@@ -132,6 +142,11 @@ class TicketOrder(models.Model):
             models.Index(fields=["created_at"]),
         ]
 
+    def save(self, *args, **kwargs):
+        if not self.order_no:
+            self.order_no = _gen_unique_no("T")
+        super().save(*args, **kwargs)
+
 
 class RefundRecord(models.Model):
     """退款记录。"""
@@ -239,6 +254,7 @@ class BoxOfficeFlow(models.Model):
         ("refund", "退款"),
         ("fee", "手续费"),
         ("adjust", "调账"),
+        ("settlement", "场次结算聚合"),
     ]
 
     performance = models.ForeignKey(Performance, on_delete=models.CASCADE, related_name="boxoffice_flows")

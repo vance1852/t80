@@ -50,12 +50,18 @@ class SplitInput:
     points_discount: Decimal = ZERO
     should_split_amount: Decimal = ZERO
 
+    is_refund: Optional[bool] = None
+
     coupon_bearer_type: str = "platform"
     points_bearer_type: str = "platform"
     refund_bearer_type: str = "share"
 
     coupon_bearer_party_id: Optional[int] = None
     points_bearer_party_id: Optional[int] = None
+
+    coupon_bear_by_party: Optional[Dict[int, Decimal]] = None
+    points_bear_by_party: Optional[Dict[int, Decimal]] = None
+    refund_bear_by_party: Optional[Dict[int, Decimal]] = None
 
 
 @dataclass
@@ -220,7 +226,9 @@ class SplitRuleEngine:
             result.warnings.append("分账规则无生效明细项")
             return result
 
-        is_refund = input_data.should_split_amount < ZERO or input_data.refund_amount > ZERO
+        is_refund = input_data.is_refund
+        if is_refund is None:
+            is_refund = input_data.should_split_amount < ZERO or input_data.refund_amount > ZERO
         result.is_refund = is_refund
 
         gross = q2(input_data.gross_amount)
@@ -265,6 +273,7 @@ class SplitRuleEngine:
                 pr.base_amount = net_after_refund
                 pr.split_rate = tax_rate
                 pr.split_amount = tax_amount
+                pr.net_amount = q2(tax_amount)
                 pr.calc_note = "税费扣除"
                 processed_tax = True
                 remaining = q2(remaining - tax_amount)
@@ -362,6 +371,13 @@ class SplitRuleEngine:
             pr.points_bear = q2(points_alloc.get(pr.party_id, ZERO))
             pr.refund_bear = q2(refund_alloc.get(pr.party_id, ZERO))
 
+            if input_data.coupon_bear_by_party and pr.party_id in input_data.coupon_bear_by_party:
+                pr.coupon_bear = q2(pr.coupon_bear + input_data.coupon_bear_by_party[pr.party_id])
+            if input_data.points_bear_by_party and pr.party_id in input_data.points_bear_by_party:
+                pr.points_bear = q2(pr.points_bear + input_data.points_bear_by_party[pr.party_id])
+            if input_data.refund_bear_by_party and pr.party_id in input_data.refund_bear_by_party:
+                pr.refund_bear = q2(pr.refund_bear + input_data.refund_bear_by_party[pr.party_id])
+
         result.party_results = party_results
         result.total_split_amount = q2(sum(p.split_amount for p in party_results))
         result.total_rollback_amount = q2(sum(p.rollback_amount for p in party_results))
@@ -396,6 +412,7 @@ class SplitRuleEngine:
                 coupon_discount=flow.coupon_discount,
                 points_discount=flow.points_discount,
                 should_split_amount=flow.should_split_amount,
+                is_refund=(flow.flow_type == "refund"),
             )
 
         calc_result = self.calculate(input_data)
@@ -471,5 +488,6 @@ class SplitRuleEngine:
             coupon_discount=q2(coupon_discount),
             points_discount=q2(points_discount),
             should_split_amount=should_split,
+            is_refund=False,
         )
         return engine.calculate(input_data)

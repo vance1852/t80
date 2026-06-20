@@ -117,7 +117,9 @@ class FinanceReportService:
         period_end: Optional[date] = None,
     ) -> List[Dict]:
         """按演出维度的票房与分账报表。"""
-        flows = BoxOfficeFlow.objects.select_related("show")
+        flows = BoxOfficeFlow.objects.select_related("show").filter(
+            flow_type__in=["sale", "refund"]
+        )
         if show_id:
             flows = flows.filter(show_id=show_id)
         if period_start:
@@ -186,10 +188,7 @@ class FinanceReportService:
                 "total_net_received": q2(row["total_net_received"]),
                 "total_should_split": q2(row["total_should_split"]),
                 "total_split_net": total_split_net,
-                "check_balance": q2(q2(row["total_net_received"]) - total_split_net
-                                    - abs(q2(row["total_payment_fee"]))
-                                    - abs(q2(row["total_channel_fee"]))
-                                    + q2(row["total_refund"])),
+                "check_balance": q2(q2(row["total_net_received"]) - total_split_net),
                 "party_splits": party_list,
             })
         return result
@@ -204,7 +203,9 @@ class FinanceReportService:
         period_end: Optional[date] = None,
     ) -> List[Dict]:
         """按场次维度的票房与分账报表。"""
-        flows = BoxOfficeFlow.objects.select_related("performance", "performance__show")
+        flows = BoxOfficeFlow.objects.select_related("performance", "performance__show").filter(
+            flow_type__in=["sale", "refund"]
+        )
         if show_id:
             flows = flows.filter(show_id=show_id)
         if performance_id:
@@ -288,7 +289,9 @@ class FinanceReportService:
         period_end: Optional[date] = None,
     ) -> List[Dict]:
         """按渠道维度的票房与佣金报表。"""
-        flows = BoxOfficeFlow.objects.select_related("channel")
+        flows = BoxOfficeFlow.objects.select_related("channel").filter(
+            flow_type__in=["sale", "refund"]
+        )
         if period_start:
             flows = flows.filter(biz_date__gte=period_start)
         if period_end:
@@ -353,7 +356,7 @@ class FinanceReportService:
         show_id: Optional[int] = None,
     ) -> List[Dict]:
         """按时间维度（日/月）的趋势报表。"""
-        flows = BoxOfficeFlow.objects.all()
+        flows = BoxOfficeFlow.objects.filter(flow_type__in=["sale", "refund"])
         if show_id:
             flows = flows.filter(show_id=show_id)
         if period_start:
@@ -423,13 +426,33 @@ class FinanceReportService:
             refund_bear=Sum("refund_bear"),
             settled_split=Sum("net_amount", filter=Q(is_settled=True)),
             unsettled_split=Sum("net_amount", filter=Q(is_settled=False)),
-            order_count=Count("flow__order_id", distinct=True),
         ).order_by("party__party_type", "party__name")
 
-        from ..models import SettlementStatement
+        from ..models import SettlementStatement, TicketOrder
+
+        # 预计算每个 party 参与的 performance 集合，再统计订单数（场次级分账架构）
+        perf_map: Dict[int, set] = {}
+        perf_ids_qs = SplitDetail.objects.values_list("party_id", "flow__performance_id")
+        if period_start:
+            perf_ids_qs = perf_ids_qs.filter(biz_date__gte=period_start)
+        if period_end:
+            perf_ids_qs = perf_ids_qs.filter(biz_date__lte=period_end)
+        for pid, perf_id in perf_ids_qs:
+            if perf_id is None:
+                continue
+            perf_map.setdefault(pid, set()).add(perf_id)
+
         result = []
         for row in agg:
             pid = row["party_id"]
+            perf_ids = list(perf_map.get(pid, set()))
+            order_filter = TicketOrder.objects.filter(performance_id__in=perf_ids) if perf_ids else TicketOrder.objects.none()
+            if period_start:
+                order_filter = order_filter.filter(created_at__date__gte=period_start)
+            if period_end:
+                order_filter = order_filter.filter(created_at__date__lte=period_end)
+            order_count = order_filter.count() if perf_ids else 0
+
             stmts = SettlementStatement.objects.filter(party_id=pid)
             if period_start:
                 stmts = stmts.filter(period_end__gte=period_start)
@@ -444,7 +467,7 @@ class FinanceReportService:
                 "party_id": pid,
                 "party_name": row["party__name"],
                 "party_type": row["party__party_type"],
-                "order_count": row["order_count"],
+                "order_count": order_count,
                 "total_split_amount": q2(row["split_amount"]),
                 "total_rollback_amount": q2(row["rollback_amount"]),
                 "total_coupon_bear": q2(row["coupon_bear"]),
@@ -470,7 +493,7 @@ class FinanceReportService:
         period_end: Optional[date] = None,
     ) -> Dict:
         """财务仪表盘总览。"""
-        flows = BoxOfficeFlow.objects.all()
+        flows = BoxOfficeFlow.objects.filter(flow_type__in=["sale", "refund"])
         splits = SplitDetail.objects.all()
         if period_start:
             flows = flows.filter(biz_date__gte=period_start)

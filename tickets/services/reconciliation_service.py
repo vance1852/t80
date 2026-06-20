@@ -81,8 +81,10 @@ class ReconciliationService:
 
     @staticmethod
     def _aggregate_flow(flow_filters: Dict) -> Dict:
-        """聚合票房流水。"""
-        flows = BoxOfficeFlow.objects.filter(**flow_filters)
+        """聚合票房流水（只统计明细层：sale + refund，排除 settlement 聚合层）。"""
+        flows = BoxOfficeFlow.objects.filter(
+            **flow_filters, flow_type__in=["sale", "refund"]
+        )
         agg = flows.aggregate(
             total_net_received=Sum("net_received"),
             total_gross=Sum("gross_amount"),
@@ -99,7 +101,7 @@ class ReconciliationService:
             "gross": q2(agg.get("total_gross") or ZERO),
             "payment_fee": q2(agg.get("total_payment_fee") or ZERO),
             "channel_fee": q2(agg.get("total_channel_fee") or ZERO),
-            "refund": q2(agg.get("total_refund") or ZERO),
+            "refund": q2(abs(agg.get("total_refund") or ZERO)),
             "coupon": q2(agg.get("total_coupon") or ZERO),
             "points": q2(agg.get("total_points") or ZERO),
             "ticket": q2(agg.get("total_ticket") or ZERO),
@@ -147,22 +149,16 @@ class ReconciliationService:
     ) -> Dict:
         """检查平账状态，返回平账指标（不写数据库）。
 
-        核心校验公式：
-            实收 - 分账净额 + 退款(流水refund字段) + 手续费(绝对值) - 承担合计 ≈ 0
+        核心校验公式（场次级聚合分账架构）：
+            净实收(明细层 sale+refund 的 net_received 合计)
+                = SUM(settlement 层 SplitDetail.net_amount)
 
-        推导：
-            每笔订单：
-              实收 = 用户支付 = 原始票款 - 优惠 - 积分 - 退款 - 手续费
-              分账净额 = 应分给各方 = (实收 - 税 - 固定抽成) * 各方比例
-              优惠和积分：由承担方自己从分账中扣除（coupon_bear等）
-              退票：产生回滚流水，rollback_amount冲减各方分账
-
-            全局：
-              SUM(实收) = SUM(分账净额) + SUM(优惠承担) + SUM(积分承担) + SUM(退票承担)
-                          + SUM(手续费) - SUM(退款退回给用户)
-
-            即：
-              实收 - 分账净额 - 优惠承担 - 积分承担 - 退票承担 - 手续费 + 退款 = 0
+        说明：
+            明细层 net_received = 用户实际现金到账
+            结算层 SplitDetail 合计 = 按规则分给各方的金额总和
+            coupon_bear / points_bear / refund_bear 是各方内部承担（从分账里扣），
+                不影响总账现金，只影响各方实际到手金额
+            因此总体现金恒等式：净实收 = 各方分账净额合计
         """
         flow_filters, split_filters = ReconciliationService._build_filter_kwargs(
             recon_type, show_id, performance_id, period_start, period_end
@@ -177,7 +173,7 @@ class ReconciliationService:
         total_fee = q2(abs(flow_agg["payment_fee"]) + abs(flow_agg["channel_fee"]))
         total_refund = flow_agg["refund"]
 
-        difference = q2(net_received - split_net - bear_total - total_fee + total_refund)
+        difference = q2(net_received - split_net)
 
         is_balanced = abs(difference) < Decimal("0.01")
 
@@ -197,7 +193,7 @@ class ReconciliationService:
             "gross_amount": flow_agg["gross"],
             "flow_count": flow_agg["flow_count"],
             "split_count": split_agg["split_count"],
-            "formula": "实收 - 分账净额 - 优惠承担 - 积分承担 - 退票承担 - 手续费 + 退款 = 0",
+            "formula": "净实收(明细层sale+refund) = 各方分账净额(SplitDetail合计)",
         }
 
     @staticmethod
@@ -307,7 +303,7 @@ class ReconciliationService:
             if flow.flow_type == "refund" and flow.id not in flow_ids_with_split:
                 diff_type = "rollback_missing"
 
-            if flow.order_id and flow.order.recons.filter(is_resolved=False).exists():
+            if flow.order_id and flow.order.recon_diffs.filter(is_resolved=False).exists():
                 continue
 
             d = ReconciliationDiff.objects.create(

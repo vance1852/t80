@@ -167,10 +167,9 @@ class OrderViewSet(viewsets.ModelViewSet):
             refunded_amount=ZERO,
             status="paid",
         )
-        perf.sold_seats += data["quantity"]
-        perf.save(update_fields=["sold_seats"])
 
         BoxOfficeService.collect_from_order(order)
+        BoxOfficeService.settle_performance(perf.pk)
 
         return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
