@@ -128,8 +128,11 @@ class BoxOfficeService:
         refund_fee: Decimal = ZERO,
         reason: str = "",
         operator: str = "",
-    ) -> Tuple[RefundRecord, BoxOfficeFlow]:
-        """处理退款：创建退款记录 + refund 流水（不直接分账），随后自动重算场次结算。"""
+    ) -> Tuple[RefundRecord, BoxOfficeFlow, List[SplitDetail]]:
+        """处理退款：创建退款记录 + refund 流水，随后自动重算场次结算。
+
+        原子事务：任何一步失败全部回滚，避免数据不一致。
+        """
         qty = refund_quantity or order.quantity
         amt = q2(refund_amount)
         if amt <= ZERO:
@@ -201,9 +204,9 @@ class BoxOfficeService:
         BoxOfficeService._update_summaries(rollback_flow)
 
         # 重算该场次的场次结算（聚合后再分账）
-        BoxOfficeService.settle_performance(perf.pk)
+        _, settle_splits = BoxOfficeService.settle_performance(perf.pk)
 
-        return refund, rollback_flow
+        return refund, rollback_flow, settle_splits
 
     @staticmethod
     @transaction.atomic

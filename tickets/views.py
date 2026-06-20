@@ -503,7 +503,10 @@ class SettlementFlowViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def confirm(self, request, pk=None):
-        flow = SettlementService.confirm_settlement_flow(int(pk))
+        try:
+            flow = SettlementService.confirm_settlement_flow(int(pk))
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(SettlementFlowSerializer(flow).data)
 
 

@@ -306,10 +306,20 @@ class SettlementService:
         remark: str = "",
     ) -> SettlementFlow:
         """手动创建结算流水（调账等场景）。"""
-        party = SettlementParty.objects.get(pk=party_id)
+        try:
+            party = SettlementParty.objects.get(pk=party_id)
+        except SettlementParty.DoesNotExist:
+            raise ValueError("结算方不存在")
+
         stmt = None
         if statement_id:
-            stmt = SettlementStatement.objects.get(pk=statement_id)
+            try:
+                stmt = SettlementStatement.objects.get(pk=statement_id)
+            except SettlementStatement.DoesNotExist:
+                raise ValueError("结算单不存在")
+            if stmt.party_id != party_id:
+                raise ValueError("结算单所属结算方不一致")
+
         sflow = SettlementFlow.objects.create(
             flow_no=_gen_settlement_flow_no(),
             flow_type=flow_type,
@@ -321,22 +331,24 @@ class SettlementService:
             operator=operator,
             remark=remark,
         )
-        if stmt and flow_type == "payout" and sflow.status == "completed":
-            stmt.paid_amount = q2(stmt.paid_amount + sflow.amount)
-            stmt.pending_amount = q2(stmt.payable_amount - stmt.paid_amount)
-            if stmt.pending_amount <= ZERO:
-                stmt.status = "settled"
-                stmt.settled_at = timezone.now()
-            stmt.save()
         return sflow
 
     @staticmethod
+    @transaction.atomic
     def confirm_settlement_flow(flow_id: int) -> SettlementFlow:
-        """确认结算流水到账。"""
-        sflow = SettlementFlow.objects.select_for_update().get(pk=flow_id)
+        """确认结算流水到账（原子事务）。"""
+        try:
+            sflow = SettlementFlow.objects.select_for_update().get(pk=flow_id)
+        except SettlementFlow.DoesNotExist:
+            raise ValueError("结算流水不存在")
+
+        if sflow.status != "pending":
+            raise ValueError(f"流水状态为 {sflow.status}，无法确认")
+
         sflow.status = "completed"
         sflow.confirmed_at = timezone.now()
         sflow.save(update_fields=["status", "confirmed_at"])
+
         if sflow.statement and sflow.flow_type == "payout":
             stmt = sflow.statement
             stmt.paid_amount = q2(stmt.paid_amount + sflow.amount)
@@ -345,4 +357,5 @@ class SettlementService:
                 stmt.status = "settled"
                 stmt.settled_at = timezone.now()
             stmt.save()
+
         return sflow
